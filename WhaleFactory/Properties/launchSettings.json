@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "Dockerization": {
+      "commandName": "Project",
+      "commandLineArgs": "--context c:\\Development\\SmartStore-ActivityManager\\activitymanager-backend --solution ActivityManager.Api.sln --publish ActivityManager.Activity.Api\\ActivityManager.Activity.Api.csproj --auto-depth 0 --auto-exclude \"(?i)models|actions|core|common|ui\" --verbose --template buildkit --no-auto-test -T ActivityManager.Activity.Tests;ActivityManager.Store.Tests;ActivityManager.Upload.Tests"
+    }
+  }
+}

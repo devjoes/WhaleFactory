@@ -1,0 +1,85 @@
+﻿ARG OUTPUT_DIR="/output/"
+ARG VERSION="{{ frameworks.majors[0] }}-buster"
+
+FROM mcr.microsoft.com/dotnet/core/aspnet:$VERSION-slim AS base
+WORKDIR /app
+EXPOSE 5000
+USER 33
+
+FROM mcr.microsoft.com/dotnet/core/sdk:$VERSION AS deps
+ARG PrivateNugetSource
+ARG OUTPUT_DIR
+RUN mkdir -p "$OUTPUT_DIR" /test /src && \
+	apt update && apt install zip -y
+WORKDIR /src
+
+{{if frameworks.majors.size > 1}}{{for fw in frameworks.majors | array.offset 1}}
+RUN curl "https://dot.net/v1/dotnet-install.sh" -OL && chmod +x dotnet-install.sh && \
+	./dotnet-install.sh --channel "{{fw | string.slice 0 3}}" --version latest --install-dir "/usr/share/dotnet"; \
+	rm -Rfv dotnet-install.sh /var/lib/apt/lists/*
+{{end}}{{end}}
+
+RUN ln -s /usr/share/zoneinfo/Europe/London /usr/share/zoneinfo/GMT\ Standard\ Time; \
+	dotnet tool install --global coverlet.console
+
+COPY {{ solution_name }} */*.*proj ./
+{{for dir in dirs}}
+COPY {{dir}}/*/*.*proj ./{{dir}}/{{end}}
+
+RUN for d in "." {{for dir in dirs}}"{{dir}}"{{end}}; do \
+ for p in $(ls $d/*.*proj); do \
+  mkdir ${p%.*} -p && \
+  mv $p ${p%.*}/ ; \
+ done \
+done
+
+RUN dotnet restore {{ solution_name }} --source {%{ ${PrivateNugetSource} }%} --source https://api.nuget.org/v3/index.json
+
+WORKDIR /src
+{{for dep in common_dependencies }}
+COPY {{dep.directory}}/ {{dep.directory}}{{end}}
+
+# These are seperate stages because when using buildx they will execute in parallel
+# If one stage errors then they are all terminated before completion - so we create the file /test/fail_build
+# and defer the error until we have published the test results
+FROM deps AS build
+
+{{for dep in main_project.dependencies.exclude_previous}}
+COPY {{dep.directory}}/ {{dep.directory}}{{end}}
+COPY {{main_project.directory}}/ {{main_project.directory}}
+RUN dotnet build {{ main_project.path }} -c Release --no-restore
+
+# We need this for code coverage.
+# We zip this up because publishing lots of small files as an artifact is slow
+FROM deps AS zip_src
+COPY . /src
+RUN zip -r /src.zip /src > /dev/null
+
+{{for test in tests}}
+FROM deps AS test_{{test.name}}
+{{for dep in test.dependencies.exclude_previous}}
+COPY {{dep.directory}}/ {{dep.directory}}{{end}}
+COPY {{test.directory}}/ {{test.directory}}
+RUN dotnet build {{test.directory}} --no-restore
+RUN cd {{ test.directory }}; dll=`ls -1 bin/Debug/*/{{ test.assembly_name }}.dll | tail -n 1`; /root/.dotnet/tools/coverlet "$dll" --target "dotnet" --targetargs "test {{test.file_name}} --no-build  /clp:ForceConsoleColor --filter 'Category!=Integration' --results-directory '/test' --logger:Trx;LogFileName=/test/{{test.name}}.trx" \
+        --format cobertura && cp coverage.cobertura.xml /test/{{test.name}}.cobertura.xml \
+        || (echo '{{test.directory}} failed' | tee -a /test/fail_build)
+{{end}}
+
+FROM scratch AS output
+ARG OUTPUT_DIR
+{{for test in tests}}
+COPY --from=test_{{test.name}} /test/ $OUTPUT_DIR/test/{{end}}
+COPY --from=zip_src /src.zip $OUTPUT_DIR/
+
+FROM build AS publish
+WORKDIR /src
+RUN dotnet publish -c Release --no-restore --no-build -o /app {{main_project.path}}
+
+FROM base
+
+ENV ASPNETCORE_URLS=http://*:5000/
+WORKDIR /app
+
+COPY --from=publish /app .
+CMD ["dotnet", "{{main_project.assembly_name}}.dll"]
